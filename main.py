@@ -4,11 +4,10 @@
 """
 Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
 - Polling a la API de Stake Slide con headers sin Brotli
-- Envía solo los últimos 20 eventos a nuevos clientes (en fragmentos de 200)
-- Broadcast de nuevos eventos de Slide en lotes (máx 300)
+- Envía historial (últimos 100 eventos) y tabla de niveles al conectar
+- Broadcast de nuevos eventos de Slide
 - Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
-- Timestamps en horario de Argentina
 """
 
 import asyncio
@@ -20,8 +19,8 @@ import random
 import logging
 import os
 from datetime import datetime
-from typing import Set, Dict, Any, List
-from zoneinfo import ZoneInfo  # Python 3.9+
+from typing import Set, Dict, Any
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +33,7 @@ logger = logging.getLogger(__name__)
 # CONFIGURACIÓN SLIDE
 # ============================================
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
+
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -64,46 +64,33 @@ BLOCK_TIME = 300
 
 slide_ids: Set[str] = set()
 slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
-slide_history: List[Dict] = []
-MAX_HISTORY = 15000
+slide_history: list = []
+MAX_HISTORY = 100  # Solo los últimos 100 eventos
+
+# Variables para el sistema de niveles
+current_level = 0
+level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
-client_semaphore = asyncio.Semaphore(10)
-
-# Batching settings
-BATCH_SIZE = 300
-BATCH_FLUSH_INTERVAL = 2.0
-event_batch: List[Dict] = []
-batch_lock = asyncio.Lock()
-
-# History chunking settings
-HISTORY_CHUNK_SIZE = 200
-HISTORY_SEND_LIMIT = 20
-
-# Zona horaria Argentina
-AR_TZ = ZoneInfo('America/Argentina/Buenos_Aires')
-
-def now_argentina() -> str:
-    """Retorna timestamp actual en horario de Argentina como ISO 8601."""
-    return datetime.now(AR_TZ).isoformat()
 
 # ============================================
-# AUTO‑PING
+# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
 # ============================================
 async def self_ping():
+    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
     port = int(os.environ.get('PORT', 10000))
     url = f"http://localhost:{port}/health"
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(600)  # 10 minutos
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=5) as resp:
                     if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso")
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
                     else:
-                        logger.warning(f"[PING] Falló con código {resp.status}")
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
         except Exception as e:
-            logger.error(f"[PING] Error: {e}")
+            logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
 # FUNCIONES SLIDE
@@ -195,7 +182,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         return None
 
 async def procesar_slide(data: dict):
-    global slide_history
+    global current_level, slide_history, level_counts
     event_id = data.get('id')
     if not event_id or event_id in slide_ids:
         return
@@ -205,23 +192,42 @@ async def procesar_slide(data: dict):
     max_mult = result.get('maxMultiplier')
     started_at = data_inner.get('startedAt')
     if max_mult is not None and max_mult > 0:
+        # Actualizar nivel según el multiplicador
+        if max_mult < 2.00:
+            current_level -= 1
+        else:
+            current_level += 1
+
+        # Contar en el rango correspondiente si corresponde
+        range_key = None
+        if 3.00 <= max_mult <= 4.99:
+            range_key = '3-4.99'
+        elif 5.00 <= max_mult <= 9.99:
+            range_key = '5-9.99'
+        elif max_mult >= 10.00:
+            range_key = '10+'
+
+        if range_key:
+            level_counts[current_level][range_key] += 1
+
         evento = {
             'event_id': event_id,
             'maxMultiplier': max_mult,
             'startedAt': started_at,
-            'timestamp_recepcion': now_argentina()
+            'timestamp_recepcion': datetime.now().isoformat(),
+            'nivel': current_level  # opcional, pero útil
         }
         slide_history.insert(0, evento)
         if len(slide_history) > MAX_HISTORY:
             slide_history.pop()
-        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at}")
-
-        await add_to_batch({
+        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
+        await broadcast({
             'tipo': 'slide',
             'id': event_id,
             'maxMultiplier': max_mult,
             'startedAt': started_at,
-            'timestamp_recepcion': evento['timestamp_recepcion']
+            'timestamp_recepcion': evento['timestamp_recepcion'],
+            'nivel': current_level
         })
     else:
         logger.warning(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
@@ -236,82 +242,41 @@ async def monitor_slide():
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
 # ============================================
-# BATCH MANAGEMENT
+# SERVIDOR HTTP + WEBSOCKET (para clientes)
 # ============================================
-async def add_to_batch(event: Dict[str, Any]):
-    global event_batch
-    async with batch_lock:
-        event_batch.append(event)
-        if len(event_batch) >= BATCH_SIZE:
-            await flush_batch()
-
-async def flush_batch():
-    global event_batch
-    async with batch_lock:
-        if not event_batch:
-            return
-        batch_copy = event_batch[:]
-        event_batch.clear()
+async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
         return
-    message = json.dumps({
-        'tipo': 'batch',
-        'api': 'slide',
-        'eventos': batch_copy
-    }, default=str)
+    message = json.dumps(event_data, default=str)
     await asyncio.gather(
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
     )
-    logger.debug(f"Batch flusheado: {len(batch_copy)} eventos")
 
-async def batch_flusher():
-    while True:
-        await asyncio.sleep(BATCH_FLUSH_INTERVAL)
-        await flush_batch()
-
-# ============================================
-# HISTORY CHUNKING (solo últimos 20 eventos)
-# ============================================
-async def send_history_in_chunks(ws: web.WebSocketResponse, history: List[Dict], limit: int = HISTORY_SEND_LIMIT):
-    """Envía solo los últimos `limit` eventos, en fragmentos de HISTORY_CHUNK_SIZE."""
-    limited_history = history[:limit]   # tomar los más recientes (primeros en la lista)
-    total = len(limited_history)
-    if total == 0:
-        await ws.send_json({'tipo': 'historial_start', 'total': 0})
-        await ws.send_json({'tipo': 'historial_end'})
-        return
-
-    await ws.send_json({'tipo': 'historial_start', 'total': total})
-
-    for i in range(0, total, HISTORY_CHUNK_SIZE):
-        chunk = limited_history[i:i + HISTORY_CHUNK_SIZE]
-        await ws.send_json({
-            'tipo': 'historial_chunk',
-            'offset': i,
-            'chunk': chunk
-        })
-        await asyncio.sleep(0.01)
-
-    await ws.send_json({'tipo': 'historial_end'})
-
-# ============================================
-# SERVIDOR HTTP + WEBSOCKET
-# ============================================
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-
-    async with client_semaphore:
-        connected_clients.add(ws)
-        try:
-            await send_history_in_chunks(ws, slide_history)
-            logger.info(f"Cliente Slide conectado, enviados últimos {HISTORY_SEND_LIMIT} eventos")
-            async for msg in ws:
-                if msg.type == web.WSMsgType.CLOSE:
-                    break
-        finally:
-            connected_clients.remove(ws)
+    connected_clients.add(ws)
+    try:
+        # Enviar historial (últimos 100 eventos)
+        if slide_history:
+            await ws.send_json({
+                'tipo': 'historial',
+                'api': 'slide',
+                'eventos': slide_history
+            })
+        # Enviar tabla de niveles actual
+        await ws.send_json({
+            'tipo': 'nivel_counts',
+            'nivel_actual': current_level,
+            'conteos': {k: dict(v) for k, v in level_counts.items()}
+        })
+        logger.info("Cliente Slide conectado, historial y tabla de niveles enviados")
+        async for msg in ws:
+            if msg.type == web.WSMsgType.CLOSE:
+                break
+    finally:
+        connected_clients.remove(ws)
     return ws
 
 async def health_handler(request):
@@ -338,13 +303,12 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket, batching y solo últimos 20 eventos")
+    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket y auto‑ping")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_slide()),
         asyncio.create_task(self_ping()),
-        asyncio.create_task(batch_flusher()),
     ]
     try:
         await asyncio.gather(*tasks)
