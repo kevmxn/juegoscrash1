@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
-- Polling a la API de Stake Slide con headers sin Brotli
-- Envía historial a clientes WebSocket al conectar
-- Broadcast de nuevos eventos de Slide
-- Backoff exponencial y circuit breaker
-- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
-"""
-
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -28,9 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# CONFIGURACIÓN SLIDE
-# ============================================
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
 
 USER_AGENTS = [
@@ -65,31 +53,10 @@ slide_ids: Set[str] = set()
 slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
 slide_history: list = []
 MAX_HISTORY = 15000
+CHUNK_SIZE = 300
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
-# ============================================
-# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
-# ============================================
-async def self_ping():
-    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
-    port = int(os.environ.get('PORT', 10000))
-    url = f"http://localhost:{port}/health"
-    while True:
-        await asyncio.sleep(600)  # 10 minutos
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
-                    else:
-                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
-        except Exception as e:
-            logger.error(f"[PING] Error en auto‑ping: {e}")
-
-# ============================================
-# FUNCIONES SLIDE
-# ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
@@ -112,7 +79,6 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
     }
 
     try:
@@ -121,7 +87,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers['Retry-After'])
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
-                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s (Retry-After)")
+                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s")
                 return None
             if resp.status == 200:
                 slide_status['consecutive_errors'] = 0
@@ -133,7 +99,6 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 logger.warning(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     slide_status['blocked_until'] = time.time() + BLOCK_TIME
-                    logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** slide_status['consecutive_errors']))
@@ -196,7 +161,7 @@ async def procesar_slide(data: dict):
         slide_history.insert(0, evento)
         if len(slide_history) > MAX_HISTORY:
             slide_history.pop()
-        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at}")
+        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x")
         await broadcast({
             'tipo': 'slide',
             'id': event_id,
@@ -216,9 +181,6 @@ async def monitor_slide():
                 await procesar_slide(data)
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-# ============================================
-# SERVIDOR HTTP + WEBSOCKET (para clientes)
-# ============================================
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
         return
@@ -234,12 +196,24 @@ async def websocket_handler(request):
     connected_clients.add(ws)
     try:
         if slide_history:
+            total = len(slide_history)
             await ws.send_json({
-                'tipo': 'historial',
+                'tipo': 'historial_meta',
                 'api': 'slide',
-                'eventos': slide_history
+                'total': total,
+                'chunk_size': CHUNK_SIZE
             })
-        logger.info("Cliente Slide conectado, historial enviado")
+            for i in range(0, total, CHUNK_SIZE):
+                chunk = slide_history[i:i+CHUNK_SIZE]
+                await ws.send_json({
+                    'tipo': 'historial_chunk',
+                    'api': 'slide',
+                    'chunk': chunk,
+                    'chunk_index': i // CHUNK_SIZE,
+                    'total_chunks': (total + CHUNK_SIZE - 1) // CHUNK_SIZE
+                })
+                await asyncio.sleep(0.01)
+        logger.info("Cliente Slide conectado, historial enviado en lotes")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -266,12 +240,22 @@ async def start_web_server():
     logger.info(f"✅ Servidor Slide escuchando en puerto {port}")
     await asyncio.Future()
 
-# ============================================
-# MAIN
-# ============================================
+async def self_ping():
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.debug("[PING] Auto‑ping exitoso")
+        except Exception:
+            pass
+
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket y auto‑ping")
+    logger.info("🚀 Monitor SLIDE con envío de historial en lotes (CHUNK=300)")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
@@ -281,7 +265,6 @@ async def main():
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        logger.info("\n⏹ Deteniendo...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
