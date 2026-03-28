@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor unificado SLIDE + SPACEMAN con servidor HTTP para Render
+Monitor exclusivo para SLIDE (Stake) con servidor HTTP para Render
 - Slide: polling HTTP robusto (20 user‑agents, backoff, circuit breaker)
-- Spaceman: WebSocket persistente con reconexión automática
-- Servidor HTTP en el puerto de Render con endpoint /health
+- Servidor HTTP en el puerto de Render con endpoint /health y /ws
+- Logs mejorados con timestamps y niveles
 """
 
 import asyncio
@@ -15,7 +15,18 @@ import json
 import time
 import random
 import os
+import logging
 from typing import Set
+
+# ============================================
+# CONFIGURACIÓN DE LOGGING
+# ============================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # ============================================
 # CONFIGURACIÓN SLIDE
@@ -54,20 +65,6 @@ slide_ids: Set[str] = set()
 slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
 
 # ============================================
-# CONFIGURACIÓN SPACEMAN
-# ============================================
-SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
-SPACEMAN_CASINO_ID = 'ppcdk00000005349'
-SPACEMAN_CURRENCY = 'BRL'
-SPACEMAN_GAME_ID = 1301
-
-BASE_RECONNECT_DELAY = 1.0
-MAX_RECONNECT_DELAY = 60.0
-
-spaceman_last_multiplier: float = None
-spaceman_events_seen: Set[str] = set()
-
-# ============================================
 # FUNCIONES SLIDE
 # ============================================
 def get_random_user_agent() -> str:
@@ -78,22 +75,22 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
 
     if now < slide_status['blocked_until']:
         wait = slide_status['blocked_until'] - now
-        print(f"[SLIDE] 🚫 Bloqueado por {wait:.1f}s")
+        logger.info(f"[SLIDE] 🚫 Bloqueado por {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
     if now < slide_status['next_allowed_time']:
         wait = slide_status['next_allowed_time'] - now
-        print(f"[SLIDE] ⏳ Backoff {wait:.1f}s")
+        logger.info(f"[SLIDE] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    # Headers más completos para simular navegador
+    # Headers sin br (brotli) para evitar error de decodificación
     headers = {
         'User-Agent': get_random_user_agent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Encoding': 'gzip, deflate',  # IMPORTANTE: eliminamos 'br'
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
@@ -108,7 +105,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers['Retry-After'])
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
-                print(f"[SLIDE] ⚠️ Esperar {retry_after}s (Retry-After)")
+                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
 
             if resp.status == 200:
@@ -119,33 +116,32 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 slide_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + backoff
-                print(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
+                logger.warning(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     slide_status['blocked_until'] = time.time() + BLOCK_TIME
-                    print(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s por exceso de errores")
+                    logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s por exceso de errores")
                 return None
 
             if resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
-                print(f"[SLIDE] ⚠️ Rate limit, esperar {retry_after}s")
+                logger.warning(f"[SLIDE] ⚠️ Rate limit, esperar {retry_after}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     slide_status['blocked_until'] = time.time() + BLOCK_TIME
-                    print(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s por errores")
+                    logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s por errores")
                 return None
 
             if 500 <= resp.status < 600:
                 slide_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + backoff
-                print(f"[SLIDE] ❌ Error {resp.status}, backoff {backoff:.1f}s")
+                logger.error(f"[SLIDE] ❌ Error {resp.status}, backoff {backoff:.1f}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     slide_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
 
-            # Otros códigos
-            print(f"[SLIDE] ⚠️ Código inesperado: {resp.status}")
+            logger.warning(f"[SLIDE] ⚠️ Código inesperado: {resp.status}")
             slide_status['consecutive_errors'] += 1
             backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
             slide_status['next_allowed_time'] = time.time() + backoff
@@ -157,7 +153,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         slide_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
         slide_status['next_allowed_time'] = time.time() + backoff
-        print(f"[SLIDE] ⏰ Timeout, backoff {backoff:.1f}s")
+        logger.error(f"[SLIDE] ⏰ Timeout, backoff {backoff:.1f}s")
         if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
             slide_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
@@ -165,7 +161,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         slide_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
         slide_status['next_allowed_time'] = time.time() + backoff
-        print(f"[SLIDE] 💥 {e}, backoff {backoff:.1f}s")
+        logger.error(f"[SLIDE] 💥 Excepción: {e}")
         if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
             slide_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
@@ -182,12 +178,14 @@ async def procesar_slide(data: dict):
     started_at = data_inner.get('startedAt')
 
     if max_mult is not None and max_mult > 0:
-        print(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at}")
+        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at}")
+        return max_mult
     else:
-        print(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
+        logger.warning(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
+        return None
 
 async def monitor_slide():
-    print("[SLIDE] 🚀 Iniciando")
+    logger.info("[SLIDE] 🚀 Iniciando monitor")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_slide(session)
@@ -196,97 +194,80 @@ async def monitor_slide():
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
 # ============================================
-# FUNCIONES SPACEMAN (igual que antes)
+# SERVIDOR HTTP + WEBSOCKET (aiohttp)
 # ============================================
-async def monitor_spaceman():
-    global spaceman_last_multiplier
-    reconnect_delay = BASE_RECONNECT_DELAY
-    print("[SPACEMAN] 🚀 Iniciando")
+connected_clients: Set[web.WebSocketResponse] = set()
 
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(SPACEMAN_WS) as ws:
-                    print("[SPACEMAN] ✅ Conectado")
-                    subscribe_msg = {
-                        "type": "subscribe",
-                        "casinoId": SPACEMAN_CASINO_ID,
-                        "currency": SPACEMAN_CURRENCY,
-                        "key": [SPACEMAN_GAME_ID]
-                    }
-                    await ws.send_json(subscribe_msg)
-                    print("[SPACEMAN] 📡 Suscripción enviada")
-                    reconnect_delay = BASE_RECONNECT_DELAY
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    connected_clients.add(ws)
+    try:
+        logger.info("Cliente WebSocket conectado a Slide")
+        async for msg in ws:
+            if msg.type == web.WSMsgType.CLOSE:
+                break
+    finally:
+        connected_clients.remove(ws)
+        logger.info("Cliente WebSocket desconectado de Slide")
+    return ws
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = msg.json()
-                                if "gameResult" in data and data["gameResult"]:
-                                    result_str = data["gameResult"][0].get("result")
-                                    if result_str:
-                                        multiplier = float(result_str)
-                                        if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
-                                            spaceman_last_multiplier = multiplier
-                                            game_id = data.get("gameId", "unknown")
-                                            if game_id not in spaceman_events_seen:
-                                                spaceman_events_seen.add(game_id)
-                                                print(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x")
-                                            else:
-                                                print(f"[SPACEMAN] ⚠️ Duplicado: {game_id} | {multiplier:.2f}x")
-                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
-                                pass
-                        elif msg.type == aiohttp.WSMsgType.CLOSE:
-                            print("[SPACEMAN] 🔌 Conexión cerrada")
-                            break
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print(f"[SPACEMAN] ❌ Error: {ws.exception()}")
-                            break
-        except Exception as e:
-            print(f"[SPACEMAN] 💥 {e}, reconexión en {reconnect_delay:.1f}s")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
-
-# ============================================
-# SERVIDOR HTTP PARA RENDER
-# ============================================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
-async def start_http_server():
+async def root_handler(request):
+    return web.Response(text="Servidor Slide activo. Use /ws para WebSocket o /health para health check.", status=200)
+
+async def start_web_server():
     app = web.Application()
+    app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/health', health_handler)
-    app.router.add_get('/', health_handler)
-    port = int(os.environ.get('PORT', 10000))
+    app.router.add_get('/', root_handler)
+
     runner = web.AppRunner(app)
     await runner.setup()
+    port = int(os.environ.get('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"✅ Servidor HTTP escuchando en puerto {port} (endpoint /health)")
+    logger.info(f"✅ Servidor HTTP/WebSocket escuchando en puerto {port}")
     await asyncio.Future()
+
+# ============================================
+# BROADCAST PARA CLIENTES (opcional)
+# ============================================
+async def broadcast_slide(event_data: dict):
+    if not connected_clients:
+        return
+    message = json.dumps(event_data, default=str)
+    await asyncio.gather(
+        *[client.send_str(message) for client in connected_clients],
+        return_exceptions=True
+    )
 
 # ============================================
 # MAIN
 # ============================================
 async def main():
-    print("=" * 60)
-    print("🚀 Monitor unificado SLIDE + SPACEMAN con servidor HTTP")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("🚀 Monitor exclusivo de SLIDE con servidor HTTP")
+    logger.info("=" * 60)
+
+    # Crear directorio para posibles archivos
+    os.makedirs("data", exist_ok=True)
 
     tasks = [
-        asyncio.create_task(start_http_server(), name="HTTP"),
+        asyncio.create_task(start_web_server(), name="HTTP"),
         asyncio.create_task(monitor_slide(), name="Slide"),
-        asyncio.create_task(monitor_spaceman(), name="Spaceman"),
     ]
 
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        print("\n⏹ Deteniendo...")
+        logger.info("\n⏹ Deteniendo monitor...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        print("✅ Detenido")
+        logger.info("✅ Monitor detenido.")
 
 if __name__ == "__main__":
     asyncio.run(main())
