@@ -6,6 +6,7 @@ Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
 - Polling a la API de Stake Slide con headers sin Brotli
 - Envía historial (últimos 100 eventos) y tabla de niveles al conectar
 - Broadcast de nuevos eventos de Slide
+- Persistencia con SQLite
 - Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
@@ -21,6 +22,7 @@ import os
 from datetime import datetime
 from typing import Set, Dict, Any
 from collections import defaultdict
+import aiosqlite
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 # CONFIGURACIÓN SLIDE
 # ============================================
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
+DB_PATH = "slide_data.db"
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -65,13 +68,111 @@ BLOCK_TIME = 300
 slide_ids: Set[str] = set()
 slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
 slide_history: list = []
-MAX_HISTORY = 100  # Solo los últimos 100 eventos
+MAX_HISTORY = 100
 
-# Variables para el sistema de niveles
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
+
+# ============================================
+# FUNCIONES DE BASE DE DATOS
+# ============================================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Tabla de eventos
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                maxMultiplier REAL,
+                startedAt TEXT,
+                timestamp_recepcion TEXT,
+                nivel INTEGER
+            )
+        ''')
+        # Tabla de contadores por nivel
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS counts (
+                level INTEGER,
+                range TEXT,
+                count INTEGER,
+                PRIMARY KEY (level, range)
+            )
+        ''')
+        # Tabla de estado (una sola fila)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        await db.commit()
+
+async def load_from_db():
+    global slide_history, slide_ids, level_counts, current_level
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Cargar eventos (últimos 100)
+        async with db.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
+            rows = await cursor.fetchall()
+            slide_history = []
+            slide_ids.clear()
+            for row in rows:
+                event = {
+                    'event_id': row[0],
+                    'maxMultiplier': row[1],
+                    'startedAt': row[2],
+                    'timestamp_recepcion': row[3],
+                    'nivel': row[4]
+                }
+                slide_history.append(event)
+                slide_ids.add(row[0])
+        # Cargar contadores
+        async with db.execute('SELECT level, range, count FROM counts') as cursor:
+            rows = await cursor.fetchall()
+            level_counts.clear()
+            for level, rng, cnt in rows:
+                level_counts[level][rng] = cnt
+        # Cargar nivel actual
+        async with db.execute('SELECT value FROM state WHERE key = "current_level"') as cursor:
+            row = await cursor.fetchone()
+            if row:
+                current_level = int(row[0])
+            else:
+                current_level = 0
+                # Inicializar estado
+                await db.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
+                await db.commit()
+
+async def save_event(event: dict):
+    """Guarda un evento en la base de datos, manteniendo solo los últimos MAX_HISTORY."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Insertar nuevo evento
+        await db.execute('''
+            INSERT OR REPLACE INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (event['event_id'], event['maxMultiplier'], event.get('startedAt'), event['timestamp_recepcion'], event['nivel']))
+        # Eliminar eventos antiguos si hay más de MAX_HISTORY
+        await db.execute('''
+            DELETE FROM events WHERE id NOT IN (
+                SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
+            )
+        ''', (MAX_HISTORY,))
+        await db.commit()
+
+async def update_count(level: int, range_key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO counts (level, range, count) VALUES (?, ?, 1)
+            ON CONFLICT(level, range) DO UPDATE SET count = count + 1
+        ''', (level, range_key))
+        await db.commit()
+
+async def update_current_level(level: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)
+        ''', ('current_level', str(level)))
+        await db.commit()
 
 # ============================================
 # AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
@@ -192,13 +293,13 @@ async def procesar_slide(data: dict):
     max_mult = result.get('maxMultiplier')
     started_at = data_inner.get('startedAt')
     if max_mult is not None and max_mult > 0:
-        # Actualizar nivel según el multiplicador
+        # Actualizar nivel
         if max_mult < 2.00:
             current_level -= 1
         else:
             current_level += 1
 
-        # Contar en el rango correspondiente si corresponde
+        # Determinar rango para contador
         range_key = None
         if 3.00 <= max_mult <= 4.99:
             range_key = '3-4.99'
@@ -207,19 +308,27 @@ async def procesar_slide(data: dict):
         elif max_mult >= 10.00:
             range_key = '10+'
 
-        if range_key:
-            level_counts[current_level][range_key] += 1
-
+        # Crear evento
         evento = {
             'event_id': event_id,
             'maxMultiplier': max_mult,
             'startedAt': started_at,
             'timestamp_recepcion': datetime.now().isoformat(),
-            'nivel': current_level  # opcional, pero útil
+            'nivel': current_level
         }
+        # Actualizar estructuras en memoria
         slide_history.insert(0, evento)
         if len(slide_history) > MAX_HISTORY:
             slide_history.pop()
+        if range_key:
+            level_counts[current_level][range_key] += 1
+
+        # Persistir en base de datos
+        await save_event(evento)
+        if range_key:
+            await update_count(current_level, range_key)
+        await update_current_level(current_level)
+
         logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
         await broadcast({
             'tipo': 'slide',
@@ -303,8 +412,11 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket y auto‑ping")
+    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket, auto‑ping y SQLite")
     logger.info("=" * 60)
+    # Inicializar base de datos y cargar datos
+    await init_db()
+    await load_from_db()
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_slide()),
