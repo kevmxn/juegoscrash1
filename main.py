@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
 
+# Lista ampliada de User-Agents (25)
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -42,6 +43,11 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
 BASE_SLEEP = 1.0
@@ -79,6 +85,10 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+        'Referer': 'https://stake.com/',
+        'Origin': 'https://stake.com',
     }
 
     try:
@@ -87,7 +97,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers['Retry-After'])
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
-                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s")
+                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
             if resp.status == 200:
                 slide_status['consecutive_errors'] = 0
@@ -99,6 +109,7 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
                 logger.warning(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     slide_status['blocked_until'] = time.time() + BLOCK_TIME
+                    logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** slide_status['consecutive_errors']))
@@ -179,7 +190,8 @@ async def monitor_slide():
             data = await consultar_slide(session)
             if data:
                 await procesar_slide(data)
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+            # Espera más larga (5-10 segundos) para reducir la tasa de peticiones
+            await asyncio.sleep(random.uniform(5.0, 10.0))
 
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
@@ -212,7 +224,7 @@ async def websocket_handler(request):
                     'chunk_index': i // CHUNK_SIZE,
                     'total_chunks': (total + CHUNK_SIZE - 1) // CHUNK_SIZE
                 })
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)  # 50 ms entre lotes
         logger.info("Cliente Slide conectado, historial enviado en lotes")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
@@ -244,7 +256,7 @@ async def self_ping():
     port = int(os.environ.get('PORT', 10000))
     url = f"http://localhost:{port}/health"
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(600)  # 10 minutos
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=5) as resp:
@@ -255,7 +267,7 @@ async def self_ping():
 
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor SLIDE con envío de historial en lotes (CHUNK=300)")
+    logger.info("🚀 Monitor SLIDE con polling lento (5-10s) y envío de historial en lotes")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
