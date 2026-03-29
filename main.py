@@ -9,7 +9,7 @@ Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
-- Backoff exponencial y circuit breaker
+- Backoff exponencial y circuit breaker (estilo apis.py)
 - Auto‑ping cada 10 minutos
 """
 
@@ -39,9 +39,54 @@ logger = logging.getLogger(__name__)
 API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
 DB_PATH = "slide_data.db"
 
+# User Agents (misma lista extensa que en crashstake.py y apis.py)
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    # ... (misma lista que en crash, omitida por brevedad)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
 ]
 
 BASE_SLEEP = 1.0
@@ -50,10 +95,10 @@ MAX_CONSECUTIVE_ERRORS = 10
 BLOCK_TIME = 300
 
 slide_ids: Set[str] = set()
-slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
+slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
 slide_history: list = []
-MAX_HISTORY = 100
-MAX_STORAGE = 100000
+MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
+MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
 
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
@@ -101,6 +146,7 @@ async def init_db():
 async def load_from_db():
     global slide_history, slide_ids, level_counts, current_level
     async with aiosqlite.connect(DB_PATH) as db:
+        # Cargar últimos 100 eventos en memoria
         async with db.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
             rows = await cursor.fetchall()
             slide_history = []
@@ -115,6 +161,7 @@ async def load_from_db():
                 }
                 slide_history.append(event)
                 slide_ids.add(row[0])
+        # Cargar contadores y estado
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
             level_counts.clear()
@@ -135,7 +182,7 @@ async def save_event(event: dict):
             INSERT OR REPLACE INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
             VALUES (?, ?, ?, ?, ?)
         ''', (event['event_id'], event['maxMultiplier'], event.get('startedAt'), event['timestamp_recepcion'], event['nivel']))
-        # Mantener solo los últimos MAX_STORAGE eventos
+        # Mantener solo los últimos MAX_STORAGE eventos en BD
         await db.execute('''
             DELETE FROM events WHERE id NOT IN (
                 SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
@@ -159,7 +206,7 @@ async def update_current_level(level: int):
         await db.commit()
 
 # ============================================
-# AUTO‑PING, BATCH, TABLE SENDER (idénticos a crash)
+# AUTO‑PING
 # ============================================
 async def self_ping():
     port = int(os.environ.get('PORT', 10000))
@@ -176,6 +223,9 @@ async def self_ping():
         except Exception as e:
             logger.error(f"[PING] Error en auto‑ping: {e}")
 
+# ============================================
+# BATCH SENDER
+# ============================================
 async def batch_sender():
     pending_events = []
     while True:
@@ -206,6 +256,9 @@ async def send_batch(events_list: List[dict]):
     )
     logger.info(f"Enviado lote de {len(events_list)} eventos")
 
+# ============================================
+# PERIODIC TABLE SENDER
+# ============================================
 async def periodic_table_sender():
     while True:
         interval = random.uniform(TABLE_UPDATE_MIN, TABLE_UPDATE_MAX)
@@ -225,92 +278,73 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES SLIDE (polling)
+# FUNCIONES SLIDE (con backoff estilo apis.py)
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
 async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
-    if now < slide_status['blocked_until']:
-        wait = slide_status['blocked_until'] - now
-        logger.info(f"[SLIDE] 🚫 Bloqueado por {wait:.1f}s")
-        await asyncio.sleep(wait)
-        return None
     if now < slide_status['next_allowed_time']:
         wait = slide_status['next_allowed_time'] - now
-        logger.info(f"[SLIDE] ⏳ Backoff {wait:.1f}s")
+        if wait > 0.5:
+            logger.debug(f"[SLIDE] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    headers = {
-        'User-Agent': get_random_user_agent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
-
+    headers = {'User-Agent': get_random_user_agent()}
     try:
         async with session.get(API_SLIDE, headers=headers, timeout=10) as resp:
             if 'Retry-After' in resp.headers:
                 retry_after = int(resp.headers['Retry-After'])
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
-                logger.warning(f"[SLIDE] ⚠️ Esperar {retry_after}s (Retry-After)")
+                logger.warning(f"[SLIDE] ⚠️ Retry-After {retry_after}s")
                 return None
+
             if resp.status == 200:
                 slide_status['consecutive_errors'] = 0
                 return await resp.json()
+
             elif resp.status == 403:
                 slide_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + backoff
                 logger.warning(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    slide_status['blocked_until'] = time.time() + BLOCK_TIME
+                    slide_status['next_allowed_time'] = time.time() + BLOCK_TIME
                     logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
+
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + retry_after
                 slide_status['consecutive_errors'] += 1
                 logger.warning(f"[SLIDE] ⚠️ Rate limit, esperar {retry_after}s")
-                if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    slide_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
             elif 500 <= resp.status < 600:
                 slide_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
                 slide_status['next_allowed_time'] = time.time() + backoff
                 logger.error(f"[SLIDE] ❌ Error {resp.status}, backoff {backoff:.1f}s")
-                if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    slide_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
             else:
                 logger.warning(f"[SLIDE] ⚠️ Código inesperado: {resp.status}")
-                slide_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
-                slide_status['next_allowed_time'] = time.time() + backoff
-                if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    slide_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
     except asyncio.TimeoutError:
         slide_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
         slide_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[SLIDE] ⏰ Timeout, backoff {backoff:.1f}s")
-        if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            slide_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
     except Exception as e:
         slide_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
         slide_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[SLIDE] 💥 Excepción: {e}")
-        if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            slide_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
 
 async def procesar_slide(data: dict):
@@ -330,7 +364,7 @@ async def procesar_slide(data: dict):
         else:
             current_level += 1
 
-        # Rango
+        # Determinar rango
         range_key = None
         if 3.00 <= max_mult <= 4.99:
             range_key = '3-4.99'
@@ -348,14 +382,14 @@ async def procesar_slide(data: dict):
             'nivel': current_level
         }
 
-        # Memoria (últimos 100)
+        # Actualizar memoria (últimos 100 eventos)
         slide_history.insert(0, evento)
         if len(slide_history) > MAX_HISTORY:
             slide_history.pop()
         if range_key:
             level_counts[current_level][range_key] += 1
 
-        # BD (hasta MAX_STORAGE)
+        # Guardar en BD (almacena hasta MAX_STORAGE)
         await save_event(evento)
         if range_key:
             await update_count(current_level, range_key)
@@ -367,16 +401,21 @@ async def procesar_slide(data: dict):
         logger.warning(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
 async def monitor_slide():
-    logger.info("[SLIDE] 🚀 Iniciando monitor")
+    logger.info("[SLIDE] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_slide(session)
             if data:
                 await procesar_slide(data)
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
+                sleep_time = random.uniform(1.5, 2.5)
+                await asyncio.sleep(sleep_time)
+            else:
+                # Si falló, el backoff ya esperó, añadimos 1s extra para no saturar
+                await asyncio.sleep(1)
 
 # ============================================
-# SERVIDOR HTTP + WEBSOCKET (igual que crash)
+# SERVIDOR HTTP + WEBSOCKET
 # ============================================
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
