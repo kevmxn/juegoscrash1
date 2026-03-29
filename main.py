@@ -5,10 +5,10 @@
 Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
 - Polling a la API de Stake Slide con headers sin Brotli
 - Envía historial (últimos 100 eventos) y tabla de niveles al conectar
-- Broadcast de nuevos eventos en lotes de hasta 20 (o cada 1 segundo)
-- Incluye tabla de niveles actualizada en cada lote
-- Backoff exponencial y circuit breaker
+- Eventos en lotes de hasta 20 cada 1 segundo
+- Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
+- Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
 
@@ -79,7 +79,10 @@ connected_clients: Set[web.WebSocketResponse] = set()
 # Batching
 event_queue = asyncio.Queue()
 BATCH_SIZE = 20
-BATCH_TIMEOUT = 1.0  # segundos
+BATCH_TIMEOUT = 1.0  # 1 segundo
+
+TABLE_UPDATE_MIN = 60
+TABLE_UPDATE_MAX = 120
 
 # ============================================
 # FUNCIONES DE BASE DE DATOS
@@ -189,10 +192,9 @@ async def self_ping():
             logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
-# BATCH SENDER
+# BATCH SENDER (cada 1 segundo)
 # ============================================
 async def batch_sender():
-    """Envía lotes de eventos cada 1 segundo o al alcanzar BATCH_SIZE."""
     pending_events = []
     while True:
         try:
@@ -213,21 +215,38 @@ async def send_batch(events_list: List[dict]):
         return
     batch_msg = {
         'tipo': 'batch',
-        'eventos': events_list,
-        'nivel_counts': {
-            'nivel_actual': current_level,
-            'conteos': {k: dict(v) for k, v in level_counts.items()}
-        }
+        'eventos': events_list
     }
     message = json.dumps(batch_msg, default=str)
     await asyncio.gather(
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
     )
-    logger.info(f"Enviado lote de {len(events_list)} eventos + tabla de niveles")
+    logger.info(f"Enviado lote de {len(events_list)} eventos")
 
 # ============================================
-# FUNCIONES SLIDE
+# PERIODIC TABLE SENDER (cada 60-120 segundos)
+# ============================================
+async def periodic_table_sender():
+    while True:
+        interval = random.uniform(TABLE_UPDATE_MIN, TABLE_UPDATE_MAX)
+        await asyncio.sleep(interval)
+        if not connected_clients:
+            continue
+        table_msg = {
+            'tipo': 'nivel_counts',
+            'nivel_actual': current_level,
+            'conteos': {k: dict(v) for k, v in level_counts.items()}
+        }
+        message = json.dumps(table_msg, default=str)
+        await asyncio.gather(
+            *[client.send_str(message) for client in connected_clients],
+            return_exceptions=True
+        )
+        logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
+
+# ============================================
+# FUNCIONES SLIDE (polling)
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
@@ -326,11 +345,13 @@ async def procesar_slide(data: dict):
     max_mult = result.get('maxMultiplier')
     started_at = data_inner.get('startedAt')
     if max_mult is not None and max_mult > 0:
+        # Actualizar nivel
         if max_mult < 2.00:
             current_level -= 1
         else:
             current_level += 1
 
+        # Determinar rango
         range_key = None
         if 3.00 <= max_mult <= 4.99:
             range_key = '3-4.99'
@@ -360,10 +381,8 @@ async def procesar_slide(data: dict):
             await update_count(current_level, range_key)
         await update_current_level(current_level)
 
-        # Encolar para batch
-        await event_queue.put(evento)
-
         logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
+        await event_queue.put(evento)
     else:
         logger.warning(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
@@ -384,7 +403,7 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        # Enviar historial (últimos 100 eventos)
+        # Enviar historial completo (últimos 100 eventos)
         if slide_history:
             await ws.send_json({
                 'tipo': 'historial',
@@ -429,11 +448,12 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SLIDE con WebSocket, auto‑ping, SQLite y batching")
+    logger.info("🚀 Monitor Slide con batching (1s) y tabla periódica (60-120s)")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
     asyncio.create_task(batch_sender())
+    asyncio.create_task(periodic_table_sender())
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_slide()),
