@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor exclusivo para SLIDE con servidor HTTP y WebSocket
-- Polling a la API de Stake Slide
+Monitor exclusivo para Crash con servidor HTTP y WebSocket
+- Polling a la API de Stake Crash
 - Almacena hasta 100,000 eventos en SQLite
 - Envía solo los últimos 100 eventos al conectar
 - Eventos en lotes de hasta 20 cada 1 segundo
@@ -34,10 +34,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# CONFIGURACIÓN SLIDE
+# CONFIGURACIÓN Crash
 # ============================================
-API_SLIDE = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakeslide/latest'
-DB_PATH = "slide_data.db"
+API_Crash = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
+DB_PATH = "crash_data.db"
 
 # User Agents (misma lista extensa que en crashstake.py y apis.py)
 USER_AGENTS = [
@@ -94,9 +94,9 @@ MAX_SLEEP = 60.0
 MAX_CONSECUTIVE_ERRORS = 10
 BLOCK_TIME = 300
 
-slide_ids: Set[str] = set()
-slide_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
-slide_history: list = []
+Crash_ids: Set[str] = set()
+Crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
+Crash_history: list = []
 MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
 MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
 
@@ -144,13 +144,13 @@ async def init_db():
         await db.commit()
 
 async def load_from_db():
-    global slide_history, slide_ids, level_counts, current_level
+    global Crash_history, Crash_ids, level_counts, current_level
     async with aiosqlite.connect(DB_PATH) as db:
         # Cargar últimos 100 eventos en memoria
         async with db.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
             rows = await cursor.fetchall()
-            slide_history = []
-            slide_ids.clear()
+            Crash_history = []
+            Crash_ids.clear()
             for row in rows:
                 event = {
                     'event_id': row[0],
@@ -159,8 +159,8 @@ async def load_from_db():
                     'timestamp_recepcion': row[3],
                     'nivel': row[4]
                 }
-                slide_history.append(event)
-                slide_ids.add(row[0])
+                Crash_history.append(event)
+                Crash_ids.add(row[0])
         # Cargar contadores y estado
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
@@ -278,81 +278,81 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES SLIDE (con backoff estilo apis.py)
+# FUNCIONES Crash (con backoff estilo apis.py)
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
-async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
+async def consultar_Crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
-    if now < slide_status['next_allowed_time']:
-        wait = slide_status['next_allowed_time'] - now
+    if now < Crash_status['next_allowed_time']:
+        wait = Crash_status['next_allowed_time'] - now
         if wait > 0.5:
-            logger.debug(f"[SLIDE] ⏳ Backoff {wait:.1f}s")
+            logger.debug(f"[Crash] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
     headers = {'User-Agent': get_random_user_agent()}
     try:
-        async with session.get(API_SLIDE, headers=headers, timeout=10) as resp:
+        async with session.get(API_Crash, headers=headers, timeout=10) as resp:
             if 'Retry-After' in resp.headers:
                 retry_after = int(resp.headers['Retry-After'])
-                slide_status['next_allowed_time'] = time.time() + retry_after
-                slide_status['consecutive_errors'] += 1
-                logger.warning(f"[SLIDE] ⚠️ Retry-After {retry_after}s")
+                Crash_status['next_allowed_time'] = time.time() + retry_after
+                Crash_status['consecutive_errors'] += 1
+                logger.warning(f"[Crash] ⚠️ Retry-After {retry_after}s")
                 return None
 
             if resp.status == 200:
-                slide_status['consecutive_errors'] = 0
+                Crash_status['consecutive_errors'] = 0
                 return await resp.json()
 
             elif resp.status == 403:
-                slide_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
-                slide_status['next_allowed_time'] = time.time() + backoff
-                logger.warning(f"[SLIDE] 🚫 403 Forbidden - backoff {backoff:.1f}s")
-                if slide_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    slide_status['next_allowed_time'] = time.time() + BLOCK_TIME
-                    logger.error(f"[SLIDE] 🔒 Bloqueado {BLOCK_TIME}s")
+                Crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + backoff
+                logger.warning(f"[Crash] 🚫 403 Forbidden - backoff {backoff:.1f}s")
+                if Crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
+                    Crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
+                    logger.error(f"[Crash] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
 
             elif resp.status == 429:
-                retry_after = int(resp.headers.get('Retry-After', 2 ** slide_status['consecutive_errors']))
-                slide_status['next_allowed_time'] = time.time() + retry_after
-                slide_status['consecutive_errors'] += 1
-                logger.warning(f"[SLIDE] ⚠️ Rate limit, esperar {retry_after}s")
+                retry_after = int(resp.headers.get('Retry-After', 2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + retry_after
+                Crash_status['consecutive_errors'] += 1
+                logger.warning(f"[Crash] ⚠️ Rate limit, esperar {retry_after}s")
                 return None
 
             elif 500 <= resp.status < 600:
-                slide_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
-                slide_status['next_allowed_time'] = time.time() + backoff
-                logger.error(f"[SLIDE] ❌ Error {resp.status}, backoff {backoff:.1f}s")
+                Crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + backoff
+                logger.error(f"[Crash] ❌ Error {resp.status}, backoff {backoff:.1f}s")
                 return None
 
             else:
-                logger.warning(f"[SLIDE] ⚠️ Código inesperado: {resp.status}")
+                logger.warning(f"[Crash] ⚠️ Código inesperado: {resp.status}")
                 return None
 
     except asyncio.TimeoutError:
-        slide_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
-        slide_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[SLIDE] ⏰ Timeout, backoff {backoff:.1f}s")
+        Crash_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+        Crash_status['next_allowed_time'] = time.time() + backoff
+        logger.error(f"[Crash] ⏰ Timeout, backoff {backoff:.1f}s")
         return None
     except Exception as e:
-        slide_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** slide_status['consecutive_errors']))
-        slide_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[SLIDE] 💥 Excepción: {e}")
+        Crash_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+        Crash_status['next_allowed_time'] = time.time() + backoff
+        logger.error(f"[Crash] 💥 Excepción: {e}")
         return None
 
-async def procesar_slide(data: dict):
-    global current_level, slide_history, level_counts
+async def procesar_Crash(data: dict):
+    global current_level, Crash_history, level_counts
     event_id = data.get('id')
-    if not event_id or event_id in slide_ids:
+    if not event_id or event_id in Crash_ids:
         return
-    slide_ids.add(event_id)
+    Crash_ids.add(event_id)
     data_inner = data.get('data', {})
     result = data_inner.get('result', {})
     max_mult = result.get('maxMultiplier')
@@ -374,7 +374,7 @@ async def procesar_slide(data: dict):
             range_key = '10+'
 
         evento = {
-            'tipo': 'slide',
+            'tipo': 'Crash',
             'event_id': event_id,
             'maxMultiplier': max_mult,
             'startedAt': started_at,
@@ -383,9 +383,9 @@ async def procesar_slide(data: dict):
         }
 
         # Actualizar memoria (últimos 100 eventos)
-        slide_history.insert(0, evento)
-        if len(slide_history) > MAX_HISTORY:
-            slide_history.pop()
+        Crash_history.insert(0, evento)
+        if len(Crash_history) > MAX_HISTORY:
+            Crash_history.pop()
         if range_key:
             level_counts[current_level][range_key] += 1
 
@@ -395,18 +395,18 @@ async def procesar_slide(data: dict):
             await update_count(current_level, range_key)
         await update_current_level(current_level)
 
-        logger.info(f"[SLIDE] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
+        logger.info(f"[Crash] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
         await event_queue.put(evento)
     else:
-        logger.warning(f"[SLIDE] ⚠️ ID {event_id} mult inválido: {max_mult}")
+        logger.warning(f"[Crash] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
-async def monitor_slide():
-    logger.info("[SLIDE] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
+async def monitor_Crash():
+    logger.info("[Crash] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
     async with aiohttp.ClientSession() as session:
         while True:
-            data = await consultar_slide(session)
+            data = await consultar_Crash(session)
             if data:
-                await procesar_slide(data)
+                await procesar_Crash(data)
                 # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
                 sleep_time = random.uniform(1.5, 2.5)
                 await asyncio.sleep(sleep_time)
@@ -422,18 +422,18 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        if slide_history:
+        if Crash_history:
             await ws.send_json({
                 'tipo': 'historial',
-                'api': 'slide',
-                'eventos': slide_history
+                'api': 'Crash',
+                'eventos': Crash_history
             })
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
             'conteos': {k: dict(v) for k, v in level_counts.items()}
         })
-        logger.info("Cliente Slide conectado, historial y tabla de niveles enviados")
+        logger.info("Cliente Crash conectado, historial y tabla de niveles enviados")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -445,7 +445,7 @@ async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor Slide activo. Use /ws para WebSocket o /health para health check.", status=200)
+    return web.Response(text="Servidor crash activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -457,7 +457,7 @@ async def start_web_server():
     port = int(os.environ.get('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ Servidor Slide escuchando en puerto {port}")
+    logger.info(f"✅ Servidor crash escuchando en puerto {port}")
     await asyncio.Future()
 
 # ============================================
@@ -465,7 +465,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Slide con almacenamiento 100k eventos, envío últimos 100")
+    logger.info("🚀 Monitor crash con almacenamiento 100k eventos, envío últimos 100")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
@@ -473,7 +473,7 @@ async def main():
     asyncio.create_task(periodic_table_sender())
     tasks = [
         asyncio.create_task(start_web_server()),
-        asyncio.create_task(monitor_slide()),
+        asyncio.create_task(monitor_Crash()),
         asyncio.create_task(self_ping()),
     ]
     try:
